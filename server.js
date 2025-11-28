@@ -4,7 +4,8 @@
 // + Auto-Recycle Profits to Backend Wallet
 // Compatible with AI Auto Trader Real & MEV Engine V2 Enhanced
 // Deploy to Railway with TREASURY_PRIVATE_KEY env var
-// FIX: Implemented ethers.FallbackProvider for robust RPC connection.
+// FIX: Implemented robust ethers.FallbackProvider with explicit network ID
+//      and connection timeout to resolve "failed to detect network" errors.
 // ===============================================================================
 
 const express = require('express');
@@ -62,42 +63,77 @@ const RPC_URLS = [
 let provider = null;
 let signer = null;
 
-// In-memory state
-let totalEarnings = 0;
-let totalWithdrawnToCoinbase = 0;
-let totalSentToBackend = 0;
-let totalRecycled = 0;
-let autoRecycleEnabled = true;
+// The network object for Ethereum Mainnet
+const ETH_NETWORK = {
+    name: 'mainnet',
+    chainId: 1,
+};
+
+// ===============================================================================
+// FINAL ROBUST PROVIDER INITIALIZATION
+// ===============================================================================
 
 /**
- * Creates and initializes a FallbackProvider for robust RPC connections.
- * @returns {ethers.FallbackProvider} The initialized FallbackProvider.
+ * Creates and initializes a FallbackProvider, forcing immediate connection 
+ * and using a timeout for network detection to prevent stalls.
+ * @returns {ethers.FallbackProvider | null} The initialized FallbackProvider or null on failure.
  */
 async function getStableProvider() {
     if (provider) return provider;
     
-    // Convert RPC URLs to Provider objects for the FallbackProvider
-    const providers = RPC_URLS.map(url => new ethers.JsonRpcProvider(url));
+    // Attempt connection up to 3 times
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            // 1. Configure Providers for Fallback
+            const providers = RPC_URLS.map(url => {
+                // IMPORTANT: Create provider with a custom 'network' object 
+                // and other options for stability
+                const provider = new ethers.JsonRpcProvider(url, ETH_NETWORK, {
+                    polling: true, 
+                    pollingInterval: 4000,
+                    allowGzip: true
+                });
+                
+                return { provider, priority: 1, weight: 1 };
+            });
 
-    // Create a FallbackProvider that cycles through all providers
-    const fallback = new ethers.FallbackProvider(providers);
-    
-    try {
-        // Test connectivity once
-        await fallback.getBlockNumber();
-        provider = fallback;
-        if (PRIVATE_KEY) {
-            signer = new ethers.Wallet(PRIVATE_KEY, provider);
-            console.log('[OK] Treasury Wallet:', signer.address);
+            // 2. Initialize FallbackProvider
+            const fallback = new ethers.FallbackProvider(providers);
+
+            // 3. Test Connectivity with a Timeout
+            const networkDetectionPromise = fallback.getNetwork();
+            
+            // Set a timeout to prevent indefinite stalling
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error("Network detection timed out.")), 8000) // 8 second timeout
+            );
+            
+            const network = await Promise.race([networkDetectionPromise, timeoutPromise]);
+            
+            // Final check on the network chain ID
+            if (network.chainId !== 1n) {
+                throw new Error(`FallbackProvider detected wrong chain ID: ${network.chainId}`);
+            }
+
+            provider = fallback;
+            if (PRIVATE_KEY) {
+                signer = new ethers.Wallet(PRIVATE_KEY, provider);
+                console.log(`[OK] Treasury Wallet: ${signer.address}`);
+            }
+            console.log(`[OK] Fallback Provider initialized successfully on attempt ${attempt}. Active RPC: ${network.name}`);
+            return provider;
+            
+        } catch (e) {
+            console.error(`[WARN] RPC Startup Attempt ${attempt} failed: ${e.message}. Retrying in 1s...`);
+            // Wait 1 second before retrying
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
-        console.log(`[OK] Fallback Provider initialized with ${RPC_URLS.length} endpoints.`);
-        return provider;
-    } catch (e) {
-        console.error('[CRITICAL] All RPC endpoints failed to connect:', e.message);
-        provider = null;
-        signer = null;
-        return null;
     }
+    
+    console.error('[CRITICAL] All RPC connection attempts failed after 3 retries. The API will run in a disconnected state.');
+    provider = null;
+    signer = null;
+    return null;
 }
 
 async function getTreasuryBalance() {
@@ -136,7 +172,6 @@ async function autoRecycleToBackend() {
     const recycleUSD = recycleETH * ETH_PRICE;
     
     // Since this is an *in-memory* earnings pool, we just update the ledger.
-    // The actual transfer of funds would be an internal accounting step.
     totalEarnings -= recycleUSD;
     totalRecycled += recycleUSD;
     
@@ -221,11 +256,72 @@ app.get('/health', async (req, res) => {
     });
 });
 
-// ... (Other GET endpoints /balance, /earnings, /api/apex/strategies/live are OK)
+app.get('/balance', async (req, res) => {
+    const balance = await getTreasuryBalance();
+    res.json({
+        treasuryWallet: signer ? signer.address : TREASURY_WALLET,
+        balance: balance.toFixed(6),
+        balanceUSD: (balance * ETH_PRICE).toFixed(2),
+        coinbaseWallet: COINBASE_WALLET,
+        canTrade: balance >= MIN_GAS_ETH,
+        canWithdraw: balance >= MAX_GAS_FEE
+    });
+});
+
+app.get('/earnings', (req, res) => {
+    res.json({
+        totalEarnings: totalEarnings.toFixed(2),
+        totalWithdrawnToCoinbase: totalWithdrawnToCoinbase.toFixed(2),
+        totalSentToBackend: totalSentToBackend.toFixed(2),
+        availableETH: (totalEarnings / ETH_PRICE).toFixed(6),
+        coinbaseWallet: COINBASE_WALLET,
+        treasuryWallet: TREASURY_WALLET
+    });
+});
+
+// ===============================================================================
+// STRATEGY ENDPOINT (Compatible with MEV Engine V2 & AI Auto Trader)
+// ===============================================================================
+
+app.get('/api/apex/strategies/live', async (req, res) => {
+    const balance = await getTreasuryBalance();
+    
+    res.json({
+        totalPnL: totalEarnings.toFixed(2),
+        projectedHourly: totalEarnings > 0 ? (totalEarnings / 24).toFixed(2) : 15000,
+        projectedDaily: totalEarnings > 0 ? totalEarnings.toFixed(2) : 360000,
+        totalStrategies: 450,
+        activeStrategies: 360,
+        flashLoanAmount: 100,
+        treasuryBalance: balance.toFixed(6),
+        feeRecipient: COINBASE_WALLET,
+        canTrade: balance >= MIN_GAS_ETH
+    });
+});
+
+// ===============================================================================
+// 1. CREDIT EARNINGS
+// ===============================================================================
+
+app.post('/credit-earnings', (req, res) => {
+    const { amount, amountUSD } = req.body;
+    const addAmount = parseFloat(amountUSD || amount) || 0;
+    
+    if (addAmount > 0) {
+        totalEarnings += addAmount;
+        console.log('[CREDIT] $' + addAmount.toFixed(2) + ' | Total: $' + totalEarnings.toFixed(2));
+    }
+    
+    res.json({
+        success: true,
+        credited: addAmount.toFixed(2),
+        totalEarnings: totalEarnings.toFixed(2),
+        availableETH: (totalEarnings / ETH_PRICE).toFixed(6)
+    });
+});
 
 // ===============================================================================
 // 2. SEND EARNINGS -> COINBASE WALLET
-// FIX: Using modern Ethers.js v6 transaction handling
 // ===============================================================================
 
 app.post('/send-to-coinbase', async (req, res) => {
@@ -242,7 +338,6 @@ app.post('/send-to-coinbase', async (req, res) => {
             return res.status(400).json({ error: 'Invalid amount' });
         }
         
-        // Ensure provider and signer are ready
         if (!provider || !signer) {
             await getStableProvider();
             if (!provider || !signer) {
@@ -264,10 +359,8 @@ app.post('/send-to-coinbase', async (req, res) => {
         }
         
         // Use signer's built-in transaction methods for EIP-1559 compatibility
-        // The signer handles fee estimation automatically.
         const tx = await signer.sendTransaction({
             to: destination,
-            // Use ethers.parseEther for v6
             value: ethers.parseEther(ethAmount.toFixed(18)), 
         });
         
@@ -275,14 +368,14 @@ app.post('/send-to-coinbase', async (req, res) => {
         
         const usdAmount = ethAmount * ETH_PRICE;
         totalWithdrawnToCoinbase += usdAmount;
-        totalEarnings = Math.max(0, totalEarnings - usdAmount); // Assuming a successful on-chain withdrawal reduces earnings
+        totalEarnings = Math.max(0, totalEarnings - usdAmount); 
         
-        console.log(`[OK] Sent ${ethAmount} ETH to Coinbase: ${tx.hash}`);
+        console.log(`[OK] Sent ${ethAmount.toFixed(6)} ETH to Coinbase: ${tx.hash}`);
         
         res.json({
             success: true,
             txHash: tx.hash,
-            amount: ethAmount,
+            amount: ethAmount.toFixed(6),
             amountUSD: usdAmount.toFixed(2),
             to: destination,
             from: signer.address,
@@ -296,16 +389,55 @@ app.post('/send-to-coinbase', async (req, res) => {
     }
 });
 
-// Aliases remain the same
+// Aliases for send-to-coinbase
+app.post('/coinbase-withdraw', (req, res) => { req.url = '/send-to-coinbase'; app._router.handle(req, res); });
+app.post('/withdraw', (req, res) => {
+    if (!req.body.to) req.body.to = COINBASE_WALLET;
+    req.url = '/send-to-coinbase';
+    app._router.handle(req, res);
+});
+app.post('/send-eth', (req, res) => { req.url = '/send-to-coinbase'; app._router.handle(req, res); });
+app.post('/transfer', (req, res) => { req.url = '/send-to-coinbase'; app._router.handle(req, res); });
 
 // ===============================================================================
-// 3. SEND EARNINGS -> BACKEND WALLET (In-memory tracking remains the same)
+// 3. SEND EARNINGS -> BACKEND WALLET (In-memory tracking)
 // ===============================================================================
-// ... (The /send-to-backend logic is for in-memory tracking only, no change needed)
+
+app.post('/send-to-backend', async (req, res) => {
+    try {
+        const { amountUSD, amountETH } = req.body;
+        const ethAmount = parseFloat(amountETH) || (parseFloat(amountUSD) / ETH_PRICE) || 0;
+        
+        if (ethAmount <= 0) {
+            return res.status(400).json({ error: 'Invalid amount' });
+        }
+        
+        // In-memory ledger update
+        const usdAmount = ethAmount * ETH_PRICE;
+        totalSentToBackend += usdAmount;
+        totalEarnings = Math.max(0, totalEarnings - usdAmount);
+        
+        console.log('[BACKEND] Allocated ' + ethAmount.toFixed(6) + ' ETH to backend gas: $' + usdAmount.toFixed(2));
+        
+        res.json({
+            success: true,
+            allocated: ethAmount.toFixed(6),
+            allocatedUSD: usdAmount.toFixed(2),
+            to: TREASURY_WALLET,
+            remainingEarnings: totalEarnings.toFixed(2),
+            message: 'Earnings allocated to backend gas fund'
+        });
+        
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/fund-backend', (req, res) => { req.url = '/send-to-backend'; app._router.handle(req, res); });
+app.post('/fund-from-earnings', (req, res) => { req.url = '/send-to-backend'; app._router.handle(req, res); });
 
 // ===============================================================================
-// 4. BACKEND WALLET -> COINBASE (Direct treasury to your wallet)
-// FIX: Using modern Ethers.js v6 transaction handling
+// 4. BACKEND WALLET -> COINBASE
 // ===============================================================================
 
 app.post('/backend-to-coinbase', async (req, res) => {
@@ -313,7 +445,6 @@ app.post('/backend-to-coinbase', async (req, res) => {
         const { amountETH, amount } = req.body;
         let ethAmount = parseFloat(amountETH) || parseFloat(amount) || 0;
         
-        // Ensure provider and signer are ready
         if (!provider || !signer) {
             await getStableProvider();
             if (!provider || !signer) {
@@ -337,7 +468,6 @@ app.post('/backend-to-coinbase', async (req, res) => {
             });
         }
         
-        // Use signer's built-in transaction methods for EIP-1559 compatibility
         const tx = await signer.sendTransaction({
             to: COINBASE_WALLET,
             value: ethers.parseEther(ethAmount.toFixed(18)),
@@ -345,12 +475,12 @@ app.post('/backend-to-coinbase', async (req, res) => {
         
         const receipt = await tx.wait();
         
-        console.log(`[OK] Backend -> Coinbase: ${ethAmount} ETH | TX: ${tx.hash}`);
+        console.log(`[OK] Backend -> Coinbase: ${ethAmount.toFixed(6)} ETH | TX: ${tx.hash}`);
         
         res.json({
             success: true,
             txHash: tx.hash,
-            amount: ethAmount,
+            amount: ethAmount.toFixed(6),
             amountUSD: (ethAmount * ETH_PRICE).toFixed(2),
             from: signer.address,
             to: COINBASE_WALLET,
@@ -364,9 +494,73 @@ app.post('/backend-to-coinbase', async (req, res) => {
     }
 });
 
-// Aliases remain the same
-// ... (Execute endpoint logic is for simulation and remains the same)
-// ... (Auto-Recycle Control Endpoints logic remains the same)
+app.post('/transfer-to-coinbase', (req, res) => { req.url = '/backend-to-coinbase'; app._router.handle(req, res); });
+app.post('/treasury-to-coinbase', (req, res) => { req.url = '/backend-to-coinbase'; app._router.handle(req, res); });
+
+// ===============================================================================
+// EXECUTE ENDPOINT (Simulation for MEV Engine compatibility)
+// ===============================================================================
+
+app.post('/execute', async (req, res) => {
+    const balance = await getTreasuryBalance();
+    
+    // Check and attempt auto-recycle if gas is low
+    if (balance < MIN_GAS_ETH) {
+        if (autoRecycleEnabled && totalEarnings >= 35) {
+            const recycled = await autoRecycleToBackend();
+            if (!recycled.success) {
+                return res.status(400).json({
+                    error: 'Treasury needs gas funding (Auto-recycle failed/insufficient earnings)',
+                    treasuryBalance: balance.toFixed(6),
+                    minRequired: MIN_GAS_ETH,
+                    treasuryWallet: TREASURY_WALLET
+                });
+            }
+        } else {
+            return res.status(400).json({
+                error: 'Treasury needs gas funding',
+                treasuryBalance: balance.toFixed(6),
+                minRequired: MIN_GAS_ETH,
+                treasuryWallet: TREASURY_WALLET
+            });
+        }
+    }
+    
+    // Simulate flash loan profit
+    const flashAmount = req.body.amount || FLASH_LOAN_AMOUNT;
+    const profitPercent = 0.002 + (Math.random() * 0.003); // 0.2% to 0.5% profit
+    const profit = flashAmount * profitPercent * ETH_PRICE;
+    
+    totalEarnings += profit;
+    
+    res.json({
+        success: true,
+        flashLoanAmount: flashAmount,
+        profitUSD: profit.toFixed(2),
+        profitETH: (profit / ETH_PRICE).toFixed(6),
+        totalEarnings: totalEarnings.toFixed(2),
+        feeRecipient: COINBASE_WALLET,
+        mevContracts: MEV_CONTRACTS
+    });
+});
+
+// ===============================================================================
+// AUTO-RECYCLE CONTROL ENDPOINTS
+// ===============================================================================
+
+app.post('/toggle-auto-recycle', (req, res) => {
+    autoRecycleEnabled = !autoRecycleEnabled;
+    res.json({  
+        success: true,  
+        autoRecycleEnabled: autoRecycleEnabled,
+        message: autoRecycleEnabled ? 'Auto-recycle enabled' : 'Auto-recycle disabled'
+    });
+});
+
+app.post('/recycle-now', async (req, res) => {
+    const result = await autoRecycleToBackend();
+    res.json(result);
+});
 
 // ===============================================================================
 // STARTUP - Uses the new getStableProvider
@@ -386,7 +580,7 @@ app.listen(PORT, '0.0.0.0', async function() {
         try {
             balance = await getTreasuryBalance();
         } catch (e) {
-            console.log('[WARN] Could not get initial balance:', e.message);
+            console.log('[WARN] Could not get initial balance.');
         }
     }
     
