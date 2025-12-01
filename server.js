@@ -23,10 +23,10 @@ const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 // ===============================================================================
 
 // YOUR Coinbase wallet - ALL profits go here
-const COINBASE_WALLET = '0xA0D44B2B1E2E828B466a458e3D08384B950ed655';
+const COINBASE_WALLET = '0xaFb88bD20CC9AB943fCcD050fa07D998Fc2F0b7C';
 
 // Backend/Treasury wallet - holds ETH for gas
-const TREASURY_WALLET = '0xA0D44B2B1E2E828B466a458e3D08384B950ed655';
+const TREASURY_WALLET = '0xaFb88bD20CC9AB943fCcD050fa07D998Fc2F0b7C';
 
 // Flash Loan API
 const FLASH_API = 'https://theflash-production.up.railway.app';
